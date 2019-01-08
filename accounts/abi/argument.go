@@ -111,18 +111,15 @@ func (arguments Arguments) unpackTuple(v interface{}, marshalledValues []interfa
 	if err := requireUnpackKind(value, typ, kind, arguments); err != nil {
 		return err
 	}
-	// If the output interface is a struct, make sure names don't collide
+
+	// If the interface is a struct, get of abi->struct_field mapping
+
+	var abi2struct map[string]string
 	if kind == reflect.Struct {
-		exists := make(map[string]bool)
-		for _, arg := range arguments {
-			field := capitalise(arg.Name)
-			if field == "" {
-				return fmt.Errorf("abi: purely underscored output cannot unpack to struct")
-			}
-			if exists[field] {
-				return fmt.Errorf("abi: multiple outputs mapping to the same struct field '%s'", field)
-			}
-			exists[field] = true
+		var err error
+		abi2struct, err = mapAbiToStructFields(arguments, value)
+		if err != nil {
+			return err
 		}
 	}
 	for i, arg := range arguments.NonIndexed() {
@@ -131,13 +128,9 @@ func (arguments Arguments) unpackTuple(v interface{}, marshalledValues []interfa
 
 		switch kind {
 		case reflect.Struct:
-			name := capitalise(arg.Name)
-			for j := 0; j < typ.NumField(); j++ {
-				// TODO read tags: `abi:"fieldName"`
-				if typ.Field(j).Name == name {
-					if err := set(value.Field(j), reflectValue, arg); err != nil {
-						return err
-					}
+			if structField, ok := abi2struct[arg.Name]; ok {
+				if err := set(value.FieldByName(structField), reflectValue, arg); err != nil {
+					return err
 				}
 			}
 		case reflect.Slice, reflect.Array:
@@ -164,9 +157,26 @@ func (arguments Arguments) unpackAtomic(v interface{}, marshalledValues []interf
 	if len(marshalledValues) != 1 {
 		return fmt.Errorf("abi: wrong length, expected single value, got %d", len(marshalledValues))
 	}
+
 	elem := reflect.ValueOf(v).Elem()
+	kind := elem.Kind()
 	reflectValue := reflect.ValueOf(marshalledValues[0])
+
+	var abi2struct map[string]string
+	if kind == reflect.Struct {
+		var err error
+		if abi2struct, err = mapAbiToStructFields(arguments, elem); err != nil {
+			return err
+		}
+		arg := arguments.NonIndexed()[0]
+		if structField, ok := abi2struct[arg.Name]; ok {
+			return set(elem.FieldByName(structField), reflectValue, arg)
+		}
+		return nil
+	}
+
 	return set(elem, reflectValue, arguments.NonIndexed()[0])
+
 }
 
 // Computes the full size of an array;
@@ -192,7 +202,7 @@ func (arguments Arguments) UnpackValues(data []byte) ([]interface{}, error) {
 	virtualArgs := 0
 	for index, arg := range arguments.NonIndexed() {
 		marshalledValue, err := toGoType((index+virtualArgs)*32, arg.Type, data)
-		if arg.Type.T == ArrayTy {
+		if arg.Type.T == ArrayTy && (*arg.Type.Elem).T != StringTy {
 			// If we have a static array, like [3]uint256, these are coded as
 			// just like uint256,uint256,uint256.
 			// This means that we need to add two 'virtual' arguments when
@@ -233,11 +243,7 @@ func (arguments Arguments) Pack(args ...interface{}) ([]byte, error) {
 	// input offset is the bytes offset for packed output
 	inputOffset := 0
 	for _, abiArg := range abiArgs {
-		if abiArg.Type.T == ArrayTy {
-			inputOffset += 32 * abiArg.Type.Size
-		} else {
-			inputOffset += 32
-		}
+		inputOffset += getDynamicTypeOffset(abiArg.Type)
 	}
 	var ret []byte
 	for i, a := range args {
@@ -247,14 +253,13 @@ func (arguments Arguments) Pack(args ...interface{}) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		// check for a slice type (string, bytes, slice)
-		if input.Type.requiresLengthPrefix() {
-			// calculate the offset
-			offset := inputOffset + len(variableInput)
+		// check for dynamic types
+		if isDynamicType(input.Type) {
 			// set the offset
-			ret = append(ret, packNum(reflect.ValueOf(offset))...)
-			// Append the packed output to the variable input. The variable input
-			// will be appended at the end of the input.
+			ret = append(ret, packNum(reflect.ValueOf(inputOffset))...)
+			// calculate next offset
+			inputOffset += len(packed)
+			// append to variable input
 			variableInput = append(variableInput, packed...)
 		} else {
 			// append the packed value to the input
@@ -267,14 +272,13 @@ func (arguments Arguments) Pack(args ...interface{}) ([]byte, error) {
 	return ret, nil
 }
 
-// capitalise makes the first character of a string upper case, also removing any
-// prefixing underscores from the variable names.
-func capitalise(input string) string {
-	for len(input) > 0 && input[0] == '_' {
-		input = input[1:]
+// ToCamelCase converts an under-score string to a camel-case string
+func ToCamelCase(input string) string {
+	parts := strings.Split(input, "_")
+	for i, s := range parts {
+		if len(s) > 0 {
+			parts[i] = strings.ToUpper(s[:1]) + s[1:]
+		}
 	}
-	if len(input) == 0 {
-		return ""
-	}
-	return strings.ToUpper(input[:1]) + input[1:]
+	return strings.Join(parts, "")
 }
